@@ -1,0 +1,14 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+  "python.analysis.diagnosticMode": "workspace",
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}",
+    "${workspaceFolder}/cs336-basics"
+  ],
+  "python.analysis.exclude": [
+    "**/.git",
+    "**/.venv",
+    "**/__pycache__"
+  ],
+  "python.terminal.activateEnvironment": true
+}
