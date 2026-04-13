@@ -69,11 +69,6 @@ def test_flash_forward_pass_pytorch():
 def test_flash_forward_pass_triton(is_causal):
     _test_flash_forward_pass(get_flashattention_autograd_function_triton().apply, device="cuda", is_causal=is_causal)
 
-@pytest.mark.parametrize("is_causal", [False, True])
-def test_flash_forward_pass_triton_cpu(is_causal):
-    _test_flash_forward_pass(get_flashattention_autograd_function_triton().apply, device="cpu", is_causal=is_causal)
-
-
 
 def flash_backward_results(impl, is_causal, device=None):
     q, k, v, do = _make_attn_inputs(device=device)

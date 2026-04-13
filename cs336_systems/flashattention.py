@@ -6,7 +6,6 @@ import triton.language as tl
 
 class TorchFlashAttention(torch.autograd.Function):
     # Q, K, V: [B, N, d]
-    # TODO: implement causal masking
     @staticmethod
     def forward(ctx, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, is_causal=False):
         TILE_SIZE = 16
@@ -29,13 +28,19 @@ class TorchFlashAttention(torch.autograd.Function):
         # L = sum(exp_P, dim=1)
         # O = exp_P / L
         for i in range(num_tiles):
-            m_ij = torch.full((B, TILE_SIZE,), -torch.inf)
-            l_ij = torch.zeros(B, TILE_SIZE)
-            O_ij = torch.zeros((B, TILE_SIZE, d))
+            m_ij = torch.full((B, TILE_SIZE,), -torch.inf, device=Q.device)
+            l_ij = torch.zeros((B, TILE_SIZE), device=Q.device)
+            O_ij = torch.zeros((B, TILE_SIZE, d), device=Q.device)
 
             for j in range(num_tiles):
                 # S_ij: [B, TILE_SIZE, TILE_SIZE]
                 S_ij = (Qs[i] @ Ks[j].transpose(1,2)) / math.sqrt(d)
+
+                if is_causal:
+                    q_idx = torch.arange(0, TILE_SIZE, device=Q.device) + (i * TILE_SIZE)
+                    k_idx = torch.arange(0, TILE_SIZE, device=Q.device) + (j * TILE_SIZE)
+                    causal_mask = q_idx[:, None] >= k_idx[None, :]
+                    S_ij = torch.where(causal_mask[None, :, :], S_ij, -torch.inf)
 
                 # rowsum_Sij: [B, TILE_SIZE]
                 rowsum_Sij = S_ij.sum(2)
@@ -119,6 +124,7 @@ def flash_fwd_kernel(
     D: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
+    is_causal,
 ):
     # Program indices
     # launch grid is configured such that
@@ -156,15 +162,6 @@ def flash_fwd_kernel(
     O_block_ptr = tl.make_block_ptr(
         O_ptr + batch_index * stride_qb,
         shape=(N_QUERIES, D),
-        strides=(stride_qq, stride_qd),
-        offsets=(qtile_index * Q_TILE_SIZE, 0),
-        block_shape=(Q_TILE_SIZE, D),
-        order=(1, 0),
-    )
-
-    O_block_ptr = tl.make_block_ptr(
-        O_ptr + batch_index * stride_ob,
-        shape=(N_QUERIES, D),
         strides=(stride_oq, stride_od),
         offsets=(qtile_index * Q_TILE_SIZE, 0),
         block_shape=(Q_TILE_SIZE, D),
@@ -173,32 +170,38 @@ def flash_fwd_kernel(
 
     L_block_ptr = tl.make_block_ptr(
         L_ptr + batch_index * stride_lb,
-        shape=(N_QUERIES, D),
+        shape=(N_QUERIES,),
         strides=(stride_lq,),
         offsets=(qtile_index * Q_TILE_SIZE,),
-        block_shape=(Q_TILE_SIZE),
+        block_shape=(Q_TILE_SIZE,),
         order=(0,),
     )
 
-    Tk = N_KEYS // K_TILE_SIZE
+    Tk = tl.cdiv(N_KEYS, K_TILE_SIZE)
 
+    Q_block: tl.tensor = tl.load(Q_block_ptr).to(tl.float32)
     m_ij: tl.tensor = tl.full((Q_TILE_SIZE,), float('-inf'), dtype=tl.float32)
     O_ij: tl.tensor = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
     l_ij: tl.tensor = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
+    q_idx = (qtile_index * Q_TILE_SIZE) + tl.arange(0, Q_TILE_SIZE)
     for j in range(Tk):
-        Q_block: tl.tensor = tl.load(Q_block_ptr)
         K_block: tl.tensor = tl.load(K_block_ptr)
         V_block: tl.tensor = tl.load(V_block_ptr)
 
-        S_ij: tl.tensor = tl.dot(Q_block, K_block.trans((1,0))) / scale
+        S_ij: tl.tensor = tl.dot(Q_block, K_block.trans(1,0)) / scale
 
-        rowsum_Sij = S_ij.sum(1)
+        if is_causal:
+            k_idx = j * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
+            causal_mask = q_idx[:, None] >= k_idx[None, :]
+            S_ij = tl.where(causal_mask, S_ij, float("-inf"))
+
+        rowmax_Sij = tl.max(S_ij, 1)
         prev_m_ij = m_ij
-        m_ij = tl.maximum(prev_m_ij, rowsum_Sij)
+        m_ij = tl.maximum(prev_m_ij, rowmax_Sij)
 
         exp_P_ij = tl.exp(S_ij - m_ij[:, None])
         exp_m_sub = tl.exp(prev_m_ij - m_ij)
-        l_ij = exp_m_sub * l_ij + exp_P_ij.sum(1)
+        l_ij = exp_m_sub * l_ij + tl.sum(exp_P_ij, 1)
 
         O_ij = (exp_m_sub[:, None] * O_ij) + tl.dot(exp_P_ij, V_block)
 
@@ -206,8 +209,11 @@ def flash_fwd_kernel(
         K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
         V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
 
-    tl.store(O_block_ptr, O_ij)
-    tl.store(L_block_ptr, l_ij)
+    O_i = O_ij / l_ij[:, None]
+    L_i = m_ij + tl.log(l_ij)
+
+    tl.store(O_block_ptr, O_i)
+    tl.store(L_block_ptr, L_i)
 
 class TritonFlashAttention(torch.autograd.Function):
     @staticmethod
@@ -226,15 +232,43 @@ class TritonFlashAttention(torch.autograd.Function):
             Q.stride(0), Q.stride(1), Q.stride(2),
             K.stride(0), K.stride(1), K.stride(2),
             V.stride(0), V.stride(1), V.stride(2),
-            Q.stride(0), Q.stride(1), Q.stride(2),
+            O.stride(0), O.stride(1), O.stride(2),
             L.stride(0), L.stride(1),
             NQ, NK,
             scale,
-            tl.constexpr(d),
-            tl.constexpr(Q_TILE_SIZE),
-            tl.constexpr(K_TILE_SIZE),
+            d,
+            Q_TILE_SIZE,
+            K_TILE_SIZE,
+            is_causal,
         )
 
         ctx.save_for_backward(Q, K, V, O, L)
 
-        return 
+        return O
+
+def benchmark_attention():
+    results = []
+    for ctx_length in [128, 256, 512, 1028, 2048, 4096, 8192]:
+        for embed_dim in [16, 32, 64, 128]:
+            print(f"running benchmark for ctx_length {ctx_length}, embed_dim {embed_dim}")
+
+            Q = torch.rand((1, ctx_length, 16), device="cuda")
+            K = torch.rand((1, ctx_length, 16), device="cuda")
+            V = torch.rand((1, ctx_length, 16), device="cuda")
+
+            triton_callable = lambda: TritonFlashAttention.apply(Q, K, V, True)
+            triton_res = triton.testing.do_bench(triton_callable, warmup=25, rep=100, quantiles=[0.25, 0.50, 0.75], return_mode="median")
+
+            torch.cuda.synchronize()
+
+            torch_callable = lambda: TorchFlashAttention.apply(Q, K, V, True)
+            torch_res = triton.testing.do_bench(torch_callable, warmup=25, rep=100, quantiles=[0.25, 0.50, 0.75], return_mode="median")
+
+            torch.cuda.synchronize()
+
+            print(f"ctx_length {ctx_length}, embed_dim {embed_dim}")
+            print(f"triton: {triton_res}")
+            print(f"torch: {torch_res}")
+
+if __name__ == "__main__":
+    benchmark_attention()
