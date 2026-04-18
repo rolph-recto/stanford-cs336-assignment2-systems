@@ -110,6 +110,147 @@ class TorchFlashAttention(torch.autograd.Function):
 
         return dQ, dK, dV, None
 
+# this is the naive attention kernel that flashattention improves upon
+@triton.jit
+def naive_fwd_kernel(
+    Q_ptr, K_ptr, V_ptr,
+    O_ptr, L_ptr,
+    stride_qb, stride_qq, stride_qd,
+    stride_kb, stride_kk, stride_kd,
+    stride_vb, stride_vk, stride_vd,
+    stride_ob, stride_oq, stride_od,
+    stride_lb, stride_lq,
+    N_QUERIES, N_KEYS,
+    scale,
+    D: tl.constexpr,
+    Q_TILE_SIZE: tl.constexpr,
+    K_TILE_SIZE: tl.constexpr,
+    is_causal,
+):
+    # Program indices
+    # launch grid is configured such that
+    # 1 block = 1 Q / O tile in 1 element of the batch
+    qtile_index = tl.program_id(0)
+    batch_index = tl.program_id(1)
+
+    Q_block_ptr = tl.make_block_ptr(
+        Q_ptr + batch_index * stride_qb,
+        shape=(N_QUERIES, D),
+        strides=(stride_qq, stride_qd),
+        offsets=(qtile_index * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D),
+        order=(1, 0),
+    )
+
+    K_block_ptr = tl.make_block_ptr(
+        K_ptr + batch_index * stride_kb,
+        shape=(N_KEYS, D),
+        strides=(stride_kk, stride_kd),
+        offsets=(0, 0),
+        block_shape=(K_TILE_SIZE, D),
+        order=(1, 0),
+    )
+
+    V_block_ptr = tl.make_block_ptr(
+        V_ptr + batch_index * stride_vb,
+        shape=(N_KEYS, D),
+        strides=(stride_vk, stride_vd),
+        offsets=(0, 0),
+        block_shape=(K_TILE_SIZE, D),
+        order=(1, 0),
+    )
+
+    O_block_ptr = tl.make_block_ptr(
+        O_ptr + batch_index * stride_qb,
+        shape=(N_QUERIES, D),
+        strides=(stride_oq, stride_od),
+        offsets=(qtile_index * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D),
+        order=(1, 0),
+    )
+
+    L_block_ptr = tl.make_block_ptr(
+        L_ptr + batch_index * stride_lb,
+        shape=(N_QUERIES,),
+        strides=(stride_lq,),
+        offsets=(qtile_index * Q_TILE_SIZE,),
+        block_shape=(Q_TILE_SIZE,),
+        order=(0,),
+    )
+
+    Tk = tl.cdiv(N_KEYS, K_TILE_SIZE)
+    Q_block: tl.tensor = tl.load(Q_block_ptr).to(tl.float32)
+
+    # compute:
+    # S: [Q_TILE_SIZE, N]
+    # S = (Q_block @ K.T) / sqrt(d)
+    Slist = []
+    for j in range(Tk):
+        K_block: tl.tensor = tl.load(K_block_ptr)
+        S_ij: tl.tensor = tl.dot(Q_block, K_block.trans(1,0)) / scale
+        K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
+        Slist.append(S)
+
+    S = tl.cat(Slist)
+
+    ### PEG
+    ### K_block_ptr = theta_kblk(K_block_ptr, tl.advance(theta_kblk, (K_TILE_SIZE, 0)))
+    ### K_block = tl.load(K_block_ptr)
+    ### S_ij = tl.dot(Q_block, K_block.trans(1,0)) / scale
+
+    # M: [Q_TILE_SIZE]
+    # M = max_reduce(S, dim=D)
+    M: tl.tensor = tl.full((Q_TILE_SIZE,), float('-inf'), dtype=tl.float32)
+    for S_ij in Slist:
+        rowmax_Sij = tl.max(S_ij, dim=1)
+        M = tl.maximum(M, rowmax_Sij)
+
+    ### PEG
+    ### rowmax_Sij = tl.max(S_ij, dim=1)
+
+    # exp_P: [Q_TILE_SIZE, N]
+    # exp_P = exp(S - M[:, None])
+    exp_P = exp(S - M[:, None])
+
+    ### PEG
+    ### exp_P = tl.exp(S - tl.broadcast_to(M, (Q_TILE_SIZE, N)))
+    ### exp_P must be stored/loaded from GMEM because it is indexed below
+
+    # L : [Q_TILE_SIZE]
+    # L = sum(exp_P, dim=1)
+    L: tl.tensor = tl.full((Q_TILE_SIZE,), 0.0, dtype=tl.float32)
+    for j in range(Tk):
+        L += exp_P[:, j*K_TILE_SIZE:(j+1)*K_TILE_SIZE]
+
+    ### PEG
+    ### L = theta_L(tl.full((Q_TILE_SIZE,), 0.0), exp_P[:, j*K_TILE_SIZE:(j+1)*K_TILE_SIZE])
+
+    # softmax: [Q_TILE_SIZE, N]
+    softmax = exp_P / L
+
+    ### PEG
+    ### softmax = exp_P / L
+    ### softmax must be stored/loaded from GMEM because it is indexed below
+    
+    # O: [Q_TILE_SIZE, D]
+    Olist = []
+    for i in range(Tk):
+        V_block: tl.tensor = tl.load(V_block_ptr)
+        O_ij: tl.tensor = tl.dot(softmax[:, i*K_TILE_SIZE:(i+1)*K_TILE_SIZE], V_block.trans(1,0)) / scale
+        V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
+        Olist.append(O)
+
+    O = tl.cat(Olist)
+
+    ### PEG
+    ### V_block_ptr = theta_vblk(V_block_ptr, tl.advance(V_block_ptr, (K_TILE_SIZE, 0)))
+    ### V_block = tl.load(V_block_ptr)
+    ### O_ij = tl.dot(softmax[:, i*K_TILE_SIZE:(i+1)*K_TILE_SIZE], V_block.trans(1,0)) / scale
+    ### O = tl.cat(O_ij)
+
+    tl.store(O_block_ptr, O)
+    tl.store(L_block_ptr, L)
+
 @triton.jit
 def flash_fwd_kernel(
     Q_ptr, K_ptr, V_ptr,
@@ -214,6 +355,34 @@ def flash_fwd_kernel(
 
     tl.store(O_block_ptr, O_i)
     tl.store(L_block_ptr, L_i)
+
+### FLASHATTENTION IN PEG
+###
+### Tk = tl.cdiv(N_KEY, K_TILE_SIZE)
+###
+### Q_block_ptr = tl.make_block_ptr(Q_ptr ...)
+### K_block_ptr = theta_Kblk(tl.make_block_ptr(K_ptr ...), tl.advance(theta_Kblk, (K_TILE_SIZE, 0)))
+### V_block_ptr = theta_Vblk(tl.make_block_ptr(V_ptr ...), tl.advance(theta_Vblk, (K_TILE_SIZE, 0)))
+### O_block_ptr = tl.make_block_ptr(O_ptr ...)
+### L_block_ptr = tl.make_block_ptr(L_ptr ...)
+### 
+### Q_block = tl.load(Q_block_ptr)
+###
+### K_block = tl.load(K_block_ptr)
+### V_block = tl.load(V_block_ptr)
+### S_ij = tl.dot(Q_block, K_block.trans(1,0)) / scale
+### rowmax_Sij = tl.max(S_ij, 1)
+### m_ij = theta_mij(tl.full((Q_TILE_SIZE,), -inf), tl.maximum(theta_mij, rowmax_Sij))
+### exp_P_ij = tl.exp(S_ij - m_ij[:, None])
+### exp_m_sub = tl.exp(theta_mij - tl.maximum(theta_mij, rowmax_Sij))
+### l_ij = theta_lij(tl.zeros((Q_TILE_SIZE,)), exp_m_sub * l_ij + tl.sum(exp_P_ij, 1))
+### O_ij = theta_Oij(tl.zeros((Q_TILE_SIZE, D)), (exp_m_sub[:, None] * O_ij) + tl.dot(exp_P_ij, V_block))
+###
+### O_i = O_ij / eval(Tk, l_ij) # eval(Tk, l_ij) returns the value of l_ij at index Tk-1
+### L_i = eval(Tk, m_ij) + tl.log(l_ij)
+###
+### store1 = tl.store(O_block_ptr, O_i)
+### store2 = tl.store(L_block_ptr, L_i)
 
 class TritonFlashAttention(torch.autograd.Function):
     @staticmethod
